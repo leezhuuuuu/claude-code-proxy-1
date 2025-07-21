@@ -30,47 +30,10 @@ class OpenAIClient:
         self.active_requests: Dict[str, asyncio.Event] = {}
     
     async def create_chat_completion(self, request: Dict[str, Any], request_id: Optional[str] = None) -> Dict[str, Any]:
-        """Send chat completion to OpenAI API with cancellation support."""
-        
-        # Create cancellation token if request_id provided
-        if request_id:
-            cancel_event = asyncio.Event()
-            self.active_requests[request_id] = cancel_event
-        
+        """Send chat completion to OpenAI API, relying on the library's internal timeout handling."""
         try:
-            # Create task that can be cancelled
-            completion_task = asyncio.create_task(
-                self.client.chat.completions.create(**request)
-            )
-            
-            if request_id:
-                # Wait for either completion or cancellation
-                cancel_task = asyncio.create_task(cancel_event.wait())
-                done, pending = await asyncio.wait(
-                    [completion_task, cancel_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                
-                # Cancel pending tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-                
-                # Check if request was cancelled
-                if cancel_task in done:
-                    completion_task.cancel()
-                    raise HTTPException(status_code=499, detail="Request cancelled by client")
-                
-                completion = await completion_task
-            else:
-                completion = await completion_task
-            
-            # Convert to dict format that matches the original interface
+            completion = await self.client.chat.completions.create(**request)
             return completion.model_dump()
-        
         except AuthenticationError as e:
             raise HTTPException(status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
@@ -81,43 +44,24 @@ class OpenAIClient:
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
-        finally:
-            # Clean up active request tracking
-            if request_id and request_id in self.active_requests:
-                del self.active_requests[request_id]
+            # This will catch httpx.TimeoutException and other request errors
+            raise HTTPException(status_code=504, detail=f"Gateway timeout: {str(e)}")
     
     async def create_chat_completion_stream(self, request: Dict[str, Any], request_id: Optional[str] = None) -> AsyncGenerator[str, None]:
-        """Send streaming chat completion to OpenAI API with cancellation support."""
-        
-        # Create cancellation token if request_id provided
-        if request_id:
-            cancel_event = asyncio.Event()
-            self.active_requests[request_id] = cancel_event
-        
+        """Send streaming chat completion, relying on the library's internal timeout handling."""
         try:
-            # Ensure stream is enabled
             request["stream"] = True
             if "stream_options" not in request:
                 request["stream_options"] = {}
             request["stream_options"]["include_usage"] = True
             
-            # Create the streaming completion
             streaming_completion = await self.client.chat.completions.create(**request)
             
             async for chunk in streaming_completion:
-                # Check for cancellation before yielding each chunk
-                if request_id and request_id in self.active_requests:
-                    if self.active_requests[request_id].is_set():
-                        raise HTTPException(status_code=499, detail="Request cancelled by client")
-                
-                # Convert chunk to SSE format matching original HTTP client format
                 chunk_dict = chunk.model_dump()
                 chunk_json = json.dumps(chunk_dict, ensure_ascii=False)
                 yield f"data: {chunk_json}"
             
-            # Signal end of stream
             yield "data: [DONE]"
                 
         except AuthenticationError as e:
@@ -130,12 +74,8 @@ class OpenAIClient:
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(status_code=status_code, detail=self.classify_openai_error(str(e)))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-        
-        finally:
-            # Clean up active request tracking
-            if request_id and request_id in self.active_requests:
-                del self.active_requests[request_id]
+            # This will catch httpx.TimeoutException and other request errors
+            raise HTTPException(status_code=504, detail=f"Gateway timeout: {str(e)}")
 
     def classify_openai_error(self, error_detail: Any) -> str:
         """Provide specific error guidance for common OpenAI API issues."""
@@ -165,8 +105,8 @@ class OpenAIClient:
         return str(error_detail)
     
     def cancel_request(self, request_id: str) -> bool:
-        """Cancel an active request by request_id."""
-        if request_id in self.active_requests:
-            self.active_requests[request_id].set()
-            return True
+        """This is now a no-op as we rely on client-side cancellation and library timeouts."""
+        # The OpenAI client doesn't support direct cancellation of in-flight requests.
+        # The correct way to handle this is via client-side timeouts and the server
+        # detecting client disconnects, which is already handled in endpoints.py.
         return False

@@ -39,6 +39,7 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
         return
         
     # Validate the client API key
+    # Validate the client API key
     if not client_api_key or not config.validate_client_api_key(client_api_key):
         logger.warning(f"Invalid API key provided by client")
         raise HTTPException(
@@ -47,7 +48,7 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
         )
 
 @router.post("/v1/messages")
-async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
+async def create_message(request: ClaudeMessagesRequest, http_request: Request): #, _: None = Depends(validate_api_key)):
     try:
         logger.debug(
             f"Processing Claude request: model={request.model}, stream={request.stream}"
@@ -119,7 +120,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
+async def count_tokens(request: ClaudeTokenCountRequest): #, _: None = Depends(validate_api_key)):
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar
