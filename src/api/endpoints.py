@@ -2,7 +2,9 @@ from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
 import uuid
-from typing import Optional
+import os
+import json
+from typing import Optional, AsyncGenerator
 
 from src.core.config import config
 from src.core.logging import logger
@@ -47,8 +49,57 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
             detail="Invalid API key. Please provide a valid Anthropic API key."
         )
 
+
+LOGS_DIR = "request_logs"
+if not os.path.exists(LOGS_DIR):
+    os.makedirs(LOGS_DIR)
+
+def save_request_response(request_data: dict, response_data: dict, timestamp: str):
+    """Saves the request and response to a file."""
+    log_file_path = os.path.join(LOGS_DIR, f"{timestamp}.json")
+    with open(log_file_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"request": request_data, "response": response_data},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    logger.info(f"Saved request and response to {log_file_path}")
+
+async def streaming_saver_wrapper(
+    stream: AsyncGenerator[str, None], request_data: dict, timestamp: str
+):
+    """Wraps a streaming response to save the full response at the end."""
+    response_chunks = []
+    async for chunk in stream:
+        response_chunks.append(chunk)
+        yield chunk
+
+    parsed_events = []
+    for chunk in response_chunks:
+        if not chunk.strip():
+            continue
+        
+        lines = chunk.strip().splitlines()
+        event_dict = {}
+        for line in lines:
+            if line.startswith('event: '):
+                event_dict['event'] = line[7:]
+            elif line.startswith('data: '):
+                try:
+                    event_dict['data'] = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    event_dict['data'] = line[6:]
+        if event_dict:
+            parsed_events.append(event_dict)
+
+    save_request_response(request_data, {"stream_events": parsed_events}, timestamp)
+
+
 @router.post("/v1/messages")
-async def create_message(request: ClaudeMessagesRequest, http_request: Request): #, _: None = Depends(validate_api_key)):
+async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    request_data = request.model_dump(exclude_unset=True)
     try:
         logger.debug(
             f"Processing Claude request: model={request.model}, stream={request.stream}"
@@ -70,15 +121,17 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request):
                 openai_stream = openai_client.create_chat_completion_stream(
                     openai_request, request_id
                 )
+                claude_stream = convert_openai_streaming_to_claude_with_cancellation(
+                    openai_stream,
+                    request,
+                    logger,
+                    http_request,
+                    openai_client,
+                    request_id,
+                )
+                saving_stream = streaming_saver_wrapper(claude_stream, request_data, timestamp)
                 return StreamingResponse(
-                    convert_openai_streaming_to_claude_with_cancellation(
-                        openai_stream,
-                        request,
-                        logger,
-                        http_request,
-                        openai_client,
-                        request_id,
-                    ),
+                    saving_stream,
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -98,6 +151,7 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request):
                     "type": "error",
                     "error": {"type": "api_error", "message": error_message},
                 }
+                save_request_response(request_data, error_response, timestamp)
                 return JSONResponse(status_code=e.status_code, content=error_response)
         else:
             # Non-streaming response
@@ -107,8 +161,10 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request):
             claude_response = convert_openai_to_claude_response(
                 openai_response, request
             )
+            save_request_response(request_data, claude_response, timestamp)
             return claude_response
-    except HTTPException:
+    except HTTPException as e:
+        save_request_response(request_data, {"error": {"status_code": e.status_code, "detail": e.detail}}, timestamp)
         raise
     except Exception as e:
         import traceback
@@ -116,11 +172,12 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request):
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
         error_message = openai_client.classify_openai_error(str(e))
+        save_request_response(request_data, {"error": {"status_code": 500, "detail": error_message}}, timestamp)
         raise HTTPException(status_code=500, detail=error_message)
 
 
 @router.post("/v1/messages/count_tokens")
-async def count_tokens(request: ClaudeTokenCountRequest): #, _: None = Depends(validate_api_key)):
+async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
     try:
         # For token counting, we'll use a simple estimation
         # In a real implementation, you might want to use tiktoken or similar
